@@ -1,5 +1,6 @@
 import os
 import re
+import functools
 import time
 from dataclasses import dataclass
 from glob import iglob
@@ -16,6 +17,7 @@ from PIL import Image
 from jflux.sampling import denoise, get_noise, get_schedule, prepare, unpack
 from jflux.util import configs, load_ae, load_clip, load_flow_model, load_t5
 
+jax.config.update("jax_compilation_cache_dir", "/tmp/jax_cache/")
 
 os.environ["XLA_PYTHON_CLIENT_PREALLOCATE"] = "false"
 
@@ -195,29 +197,48 @@ def main(
         guidance=guidance,
         seed=seed,
     )
-
-    while opts is not None:
-        if opts.seed is None:
-            opts.seed = jax.random.PRNGKey(seed=102333)
-        print(f"Generating with seed {opts.seed}:\n{opts.prompt}")
-        t0 = time.perf_counter()
-
-        # prepare input
-        x = get_noise(
+    opts.seed = jax.random.PRNGKey(seed=102333)
+    x = get_noise(
             num_samples=1,
             height=opts.height,
             width=opts.width,
             dtype=jnp.bfloat16,
             seed=opts.seed,
         )
-        opts.seed = None
+    #opts.seed = None
 
-        inp = prepare(t5=t5, clip=clip, img=x, prompt=opts.prompt)
-        timesteps = get_schedule(
-            num_steps=opts.num_steps,
-            image_seq_len=inp["img"].shape[1],
-            shift=(name != "flux-schnell"),
-        )
+    inp = prepare(t5=t5, clip=clip, img=x, prompt=opts.prompt)
+    timesteps = get_schedule(
+        num_steps=opts.num_steps,
+        image_seq_len=inp["img"].shape[1],
+        shift=(name != "flux-schnell"),
+    )
+
+    p_denoise = jax.jit(
+      denoise,
+      static_argnums=(0,),
+      out_shardings=(None)
+    )
+    p_denoise = p_denoise.lower(
+      model,
+      img=inp["img"],
+      img_ids=inp["img_ids"],
+      txt=inp["txt"],
+      txt_ids=inp["txt_ids"],
+      vec=inp["vec"],
+      timesteps=timesteps,
+      guidance=opts.guidance,
+    )
+    t0 = time.perf_counter()
+    p_denoise = p_denoise.compile()
+    t1 = time.perf_counter()
+    print(f"Compilation done in {t1 - t0:.1f}s.")
+
+    while opts is not None:
+        if opts.seed is None:
+            opts.seed = jax.random.PRNGKey(seed=102333)
+        print(f"Generating with seed {opts.seed}:\n{opts.prompt}")
+        t0 = time.perf_counter()
 
         if offload:
             # move t5 and clip to cpu
@@ -232,9 +253,19 @@ def main(
             jax.clear_caches()
 
         # denoise initial noise
-        x = denoise(
+        inp = prepare(t5=t5, clip=clip, img=x, prompt=opts.prompt)
+        timesteps = get_schedule(
+            num_steps=opts.num_steps,
+            image_seq_len=inp["img"].shape[1],
+            shift=(name != "flux-schnell"),
+        )
+        x = p_denoise(
             model,
-            **inp,
+            img=inp["img"],
+            img_ids=inp["img_ids"],
+            txt=inp["txt"],
+            txt_ids=inp["txt_ids"],
+            vec=inp["vec"],
             timesteps=timesteps,
             guidance=opts.guidance,
         )

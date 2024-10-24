@@ -95,24 +95,22 @@ def get_schedule(
         mu = lin_function(image_seq_len)
         timesteps = time_shift(mu, 1.0, timesteps)
 
-    return timesteps.tolist()
-
+    return timesteps
 
 def denoise(
-    model: Flux,
-    # model input
-    img: Array,
-    img_ids: Array,
-    txt: Array,
-    txt_ids: Array,
-    vec: Array,
-    # sampling parameters
-    timesteps: list[float],
-    guidance: float = 4.0,
-) -> Array:
-    # this is ignored for schnell
+      model: Flux,
+      img: Array,
+      img_ids: Array,
+      txt: Array,
+      txt_ids: Array,
+      vec: Array,
+      timesteps: Array,
+      guidance: float = 4.0,
+  ) -> Array:
     guidance_vec = jnp.full((img.shape[0],), guidance, dtype=img.dtype)
-    for t_curr, t_prev in zip(timesteps[:-1], timesteps[1:]):
+    def body_fn(carry, t,):
+        img, _ = carry
+        t_curr, t_prev = t
         t_vec = jnp.full((img.shape[0],), t_curr, dtype=img.dtype)
         pred = model(
             img=img,
@@ -123,11 +121,14 @@ def denoise(
             timesteps=t_vec,
             guidance=guidance_vec,
         )
-
         img = img + (t_prev - t_curr) * pred
-
+        img = img.astype(jnp.bfloat16)
+        return (img, t_curr), None  # Updated carry
+    timesteps_pairs = jnp.stack([timesteps[:-1], timesteps[1:]], axis=1)
+    (img, _), _ = jax.lax.scan(
+        body_fn, (img, timesteps[0]), timesteps_pairs
+    )
     return img
-
 
 def unpack(x: Array, height: int, width: int) -> Array:
     return rearrange(
